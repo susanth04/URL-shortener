@@ -3,6 +3,8 @@ from fastapi.responses import RedirectResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl, field_validator
+from prometheus_fastapi_instrumentator import Instrumentator
+from prometheus_client import Counter, Gauge
 import asyncpg
 import asyncio
 import string
@@ -12,11 +14,30 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Custom Prometheus metrics
+# ---------------------------------------------------------------------------
+REDIRECTS_TOTAL = Counter(
+    "url_shortener_redirects_total",
+    "Total number of successful URL redirects",
+)
+URLS_CREATED_TOTAL = Counter(
+    "url_shortener_urls_created_total",
+    "Total number of short URLs created",
+)
+DB_POOL_SIZE = Gauge(
+    "url_shortener_db_pool_size",
+    "Current size of the asyncpg connection pool",
+)
+
 app = FastAPI(
     title="URL Shortener",
     description="A fast, async URL shortener built with FastAPI and PostgreSQL",
     version="1.0.0",
 )
+
+# Auto-instrument all routes — exposes /metrics
+Instrumentator().instrument(app).expose(app)
 
 app.add_middleware(
     CORSMiddleware,
@@ -70,6 +91,7 @@ async def startup():
         await conn.execute("""
             UPDATE urls SET short_code = id::TEXT WHERE short_code IS NULL
         """)
+    DB_POOL_SIZE.set(pool.get_size())
     logger.info("Database schema ready.")
 
 
@@ -158,6 +180,7 @@ async def health():
 async def shorten(req: ShortenRequest):
     """Accept a long URL and return a shortened code."""
     long_url = str(req.url)
+    is_new = False
 
     async with pool.acquire() as conn:
         # De-duplicate: return existing code if URL was already shortened
@@ -175,6 +198,11 @@ async def shorten(req: ShortenRequest):
                 "UPDATE urls SET short_code = $1 WHERE id = $2",
                 short_code, row["id"],
             )
+            is_new = True
+
+    if is_new:
+        URLS_CREATED_TOTAL.inc()
+        DB_POOL_SIZE.set(pool.get_size())
 
     return ShortenResponse(
         short_code=short_code,
@@ -241,4 +269,5 @@ async def redirect(short_code: str):
             "UPDATE urls SET click_count = click_count + 1 WHERE id = $1", url_id
         )
 
+    REDIRECTS_TOTAL.inc()
     return RedirectResponse(url=row["long_url"], status_code=302)
